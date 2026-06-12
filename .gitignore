@@ -1,0 +1,21 @@
+# Ortam değişkenleri / sırlar
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Çıktılar
+outputs/*
+!outputs/.gitkeep
+sample_files/*
+!sample_files/.gitkeep
+
+# İşletim sistemi / IDE
+.DS_Store
+.idea/
+.vscode/
