@@ -16,7 +16,7 @@ Her chunk bağımsız işlenir; bir chunk hata verirse loglanır ve diğerleri d
 from __future__ import annotations
 
 import json
-from typing import Callable
+from typing import Callable, Optional
 
 from pydantic import BaseModel, Field, ValidationError
 
@@ -39,19 +39,19 @@ class SpecItem(BaseModel):
     category: str = Field(description="Maddenin ait olduğu kategori")
     title: str = Field(description="Kısa başlık")
     requirement: str = Field(description="Gerekliliğin açık ifadesi")
-    value_or_limit: str | None = Field(
+    value_or_limit: Optional[str] = Field(
         default=None, description="Varsa sayısal değer veya sınır (ör. 3 mm, 16 bar, 36 kV)"
     )
-    related_standard: str | None = Field(
+    related_standard: Optional[str] = Field(
         default=None, description="Varsa ilgili standart (ör. TS EN 60076, IEC 60137, EN 50180)"
     )
     relevance: str = Field(
         description="Bu maddenin ilgili disiplin (mekanik/elektrik) açısından önemi"
     )
-    source_quote: str | None = Field(
+    source_quote: Optional[str] = Field(
         default=None, description="Şartnameden ORİJİNAL dilde birebir alıntı"
     )
-    page_or_section: str | None = Field(
+    page_or_section: Optional[str] = Field(
         default=None, description="Sayfa veya bölüm bilgisi"
     )
     confidence: float = Field(
