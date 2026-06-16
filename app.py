@@ -1,28 +1,30 @@
-"""Mekanik Şartname Analizörü — Streamlit uygulaması.
+"""Şartname Analizörü (Mekanik + Elektrik) — Streamlit uygulaması.
 
 Çalıştırma:
     streamlit run app.py
+
+NOT: API anahtarı ve tüm YZ ayarları (model, chunking, sıcaklık, özet) koddan
+yönetilir; arayüzde son kullanıcıya açılmaz. Anahtar yalnızca .env'den okunur.
 """
 
 from __future__ import annotations
 
-import pandas as pd
 import streamlit as st
 
 from src.ai_extractor import (
     AIExtractionError,
-    FinalMechanicalReport,
-    MechanicalItem,
-    extract_mechanical_items,
+    FinalReport,
+    SpecItem,
+    extract_items,
 )
 from src.config import (
-    AVAILABLE_MODELS,
     DEFAULT_CHUNK_SIZE,
     DEFAULT_OVERLAP,
+    DISCIPLINES,
     LOW_CONFIDENCE_THRESHOLD,
-    MAX_CHUNK_SIZE,
-    MIN_CHUNK_SIZE,
+    USE_AI_SUMMARY,
     UPLOADER_TYPES,
+    discipline_label,
     get_api_key,
     get_default_model,
 )
@@ -40,7 +42,7 @@ from src.exporters import (
 )
 from src.report_builder import (
     average_confidence,
-    build_report,
+    build_reports,
     group_by_category,
     low_confidence_items,
 )
@@ -51,7 +53,7 @@ from src.utils import safe_filename, truncate
 # Sayfa ayarları + hafif stil
 # --------------------------------------------------------------------------- #
 st.set_page_config(
-    page_title="Mekanik Şartname Analizörü",
+    page_title="Şartname Analizörü",
     page_icon="⚙️",
     layout="wide",
 )
@@ -84,90 +86,37 @@ st.markdown(
 # Session state
 # --------------------------------------------------------------------------- #
 if "analysis" not in st.session_state:
-    st.session_state.analysis = None  # dict: report, items, errors, doc_chars
+    st.session_state.analysis = None  # dict: bundle, errors, doc_chars, chunk_count
 
 
 # --------------------------------------------------------------------------- #
-# Sidebar
+# Sidebar (yalnızca bilgilendirme — YZ ayarı yok)
 # --------------------------------------------------------------------------- #
 def render_sidebar() -> dict:
-    """Sidebar'ı çizer ve ayarları döndürür."""
-    st.sidebar.header("⚙️ Ayarlar")
+    """Sidebar'ı çizer ve görüntü tercihlerini döndürür (YZ ayarı içermez)."""
+    st.sidebar.header("⚙️ Bilgi")
 
-    api_key = get_api_key()
-    if api_key:
+    if get_api_key():
         st.sidebar.success("OpenAI API anahtarı bulundu (.env).")
     else:
-        st.sidebar.error("API anahtarı yok.")
-        st.sidebar.caption(
-            "Proje kökünde `.env` dosyası oluşturup `OPENAI_API_KEY=...` ekleyin "
-            "veya aşağıya yapıştırın."
+        st.sidebar.error(
+            "API anahtarı yok. Proje kökündeki `.env` dosyasına "
+            "`OPENAI_API_KEY=...` ekleyin."
         )
-    manual_key = st.sidebar.text_input(
-        "API anahtarı (opsiyonel)",
-        type="password",
-        help="Girilirse .env yerine bu anahtar kullanılır. Hiçbir yere kaydedilmez.",
-    )
-    effective_key = manual_key.strip() or api_key
 
-    st.sidebar.divider()
-    st.sidebar.subheader("Analiz Modu")
-    st.sidebar.selectbox(
-        "Mod",
-        ["Mekanik Mühendislik Analizi"],
-        index=0,
-        help="Şimdilik yalnızca mekanik analiz aktiftir. Yapı yeni modlara açıktır.",
-    )
-
-    default_model = get_default_model()
-    model = st.sidebar.selectbox(
-        "Model",
-        AVAILABLE_MODELS,
-        index=AVAILABLE_MODELS.index(default_model)
-        if default_model in AVAILABLE_MODELS
-        else 0,
+    st.sidebar.caption(
+        "Analiz kapsamı: **Mekanik + Elektrik**. Model ve analiz ayarları "
+        "uygulama tarafından yönetilir."
     )
 
     st.sidebar.divider()
-    st.sidebar.subheader("Chunking")
-    chunk_size = st.sidebar.slider(
-        "Chunk boyutu (karakter)",
-        MIN_CHUNK_SIZE,
-        MAX_CHUNK_SIZE,
-        DEFAULT_CHUNK_SIZE,
-        step=500,
-    )
-    overlap = st.sidebar.slider(
-        "Overlap (karakter)", 0, 2000, DEFAULT_OVERLAP, step=100
-    )
-
-    st.sidebar.divider()
-    st.sidebar.subheader("Filtre & Özet")
+    st.sidebar.subheader("Görünüm")
     min_confidence = st.sidebar.slider(
-        "Minimum güven skoru", 0.0, 1.0, 0.0, step=0.05
-    )
-    use_ai_summary = st.sidebar.checkbox(
-        "AI ile yönetici özeti üret", value=True
+        "Minimum güven skoru (görüntü filtresi)", 0.0, 1.0, 0.0, step=0.05,
+        help="Yalnızca tabloda/gösterimde filtreler; analiz tüm maddeleri çıkarır.",
     )
 
-    st.sidebar.divider()
-    st.sidebar.subheader("Export Seçenekleri")
-    exports = {
-        "json": st.sidebar.checkbox("JSON", value=True),
-        "excel": st.sidebar.checkbox("Excel", value=True),
-        "markdown": st.sidebar.checkbox("Markdown", value=True),
-        "pdf": st.sidebar.checkbox("PDF", value=True),
-    }
-
-    return {
-        "api_key": effective_key,
-        "model": model,
-        "chunk_size": chunk_size,
-        "overlap": overlap,
-        "min_confidence": min_confidence,
-        "use_ai_summary": use_ai_summary,
-        "exports": exports,
-    }
+    return {"min_confidence": min_confidence}
 
 
 # --------------------------------------------------------------------------- #
@@ -196,32 +145,46 @@ def read_input_document(uploaded_file, url: str) -> str | None:
 # --------------------------------------------------------------------------- #
 # Analiz akışı
 # --------------------------------------------------------------------------- #
-def run_analysis(text: str, settings: dict) -> None:
-    """Metni chunk'lar, AI ile işler, rapor üretir ve session'a yazar."""
-    if not settings["api_key"]:
-        st.error("OpenAI API anahtarı gerekli. Sidebar'dan girin veya .env tanımlayın.")
+def run_analysis(text: str) -> None:
+    """Metni chunk'lar, her disiplin için AI ile işler, raporlar üretir."""
+    api_key = get_api_key()
+    if not api_key:
+        st.error("OpenAI API anahtarı gerekli. Proje kökündeki `.env` dosyasına ekleyin.")
         return
 
-    chunks = chunk_text(text, settings["chunk_size"], settings["overlap"])
+    model = get_default_model()
+
+    chunks = chunk_text(text, DEFAULT_CHUNK_SIZE, DEFAULT_OVERLAP)
     if not chunks:
         st.error("Belgeden işlenecek metin çıkarılamadı.")
         return
 
-    st.info(f"Belge {len(chunks)} parçaya bölündü. Analiz başlıyor...")
+    st.info(
+        f"Belge {len(chunks)} parçaya bölündü. "
+        f"Disiplinler: {', '.join(discipline_label(d) for d in DISCIPLINES)}. Analiz başlıyor..."
+    )
     progress_bar = st.progress(0.0)
     status = st.empty()
 
-    def on_progress(done: int, total: int, found: int) -> None:
-        progress_bar.progress(done / total)
+    total_steps = len(chunks) * len(DISCIPLINES)
+    step_state = {"completed_disciplines": 0}
+
+    def on_progress(discipline: str, done: int, total: int, found: int) -> None:
+        overall = (step_state["completed_disciplines"] * total + done) / total_steps
+        progress_bar.progress(min(overall, 1.0))
         status.markdown(
-            f"🔄 Chunk **{done}/{total}** işlendi — şimdiye kadar **{found}** madde bulundu."
+            f"🔄 **{discipline_label(discipline)}** — chunk **{done}/{total}** "
+            f"işlendi, **{found}** madde bulundu."
         )
+        if done == total:
+            step_state["completed_disciplines"] += 1
 
     try:
-        items, errors = extract_mechanical_items(
+        items, errors = extract_items(
             chunks,
-            api_key=settings["api_key"],
-            model=settings["model"],
+            api_key=api_key,
+            disciplines=DISCIPLINES,
+            model=model,
             progress_callback=on_progress,
         )
     except AIExtractionError as exc:
@@ -242,23 +205,22 @@ def run_analysis(text: str, settings: dict) -> None:
 
     if not items:
         st.warning(
-            "Mekanik mühendisliği ilgilendiren madde bulunamadı. "
-            "Belge içeriğini veya minimum güven filtresini kontrol edin."
+            "İlgili madde bulunamadı. Belge içeriğini kontrol edin."
         )
 
-    with st.spinner("Rapor oluşturuluyor..."):
-        report, processed = build_report(
+    with st.spinner("Raporlar oluşturuluyor..."):
+        bundle = build_reports(
             items,
+            disciplines=DISCIPLINES,
             document_text=text,
-            min_confidence=settings["min_confidence"],
-            use_ai_summary=settings["use_ai_summary"],
-            api_key=settings["api_key"],
-            model=settings["model"],
+            min_confidence=0.0,
+            use_ai_summary=USE_AI_SUMMARY,
+            api_key=api_key,
+            model=model,
         )
 
     st.session_state.analysis = {
-        "report": report,
-        "items": processed,
+        "bundle": bundle,
         "errors": errors,
         "doc_chars": len(text),
         "chunk_count": len(chunks),
@@ -271,25 +233,49 @@ def run_analysis(text: str, settings: dict) -> None:
 # Sonuç görünümü
 # --------------------------------------------------------------------------- #
 def render_results(settings: dict) -> None:
-    """Analiz sonuçlarını sekmeler halinde gösterir."""
+    """Analiz sonuçlarını disiplin sekmeleri halinde gösterir."""
     analysis = st.session_state.analysis
-    report: FinalMechanicalReport = analysis["report"]
-    items: list[MechanicalItem] = analysis["items"]
+    bundle: dict = analysis["bundle"]
 
-    grouped = group_by_category(items)
-    low = low_confidence_items(items)
+    title = ""
+    for report, _items in bundle.values():
+        if report.document_title:
+            title = report.document_title
+            break
 
     st.divider()
-    st.subheader(f"📋 {report.document_title}")
+    st.subheader(f"📋 {title or 'Teknik Şartname'}")
+
+    # Üst seviye disiplin sekmeleri
+    disc_tabs = st.tabs([f"{discipline_label(d)}" for d in bundle.keys()])
+    for tab, (discipline, (report, items)) in zip(disc_tabs, bundle.items()):
+        with tab:
+            render_discipline(discipline, report, items, settings)
+
+    st.divider()
+    st.subheader("⬇️ Export")
+    render_export_buttons(bundle)
+
+
+def render_discipline(
+    discipline: str, report: FinalReport, items: list[SpecItem], settings: dict
+) -> None:
+    """Tek bir disiplinin sonuçlarını alt sekmelerde gösterir."""
+    min_conf = settings.get("min_confidence", 0.0)
+    if min_conf > 0:
+        items = [it for it in items if it.confidence >= min_conf]
+
+    grouped = group_by_category(items, discipline)
+    low = low_confidence_items(items)
 
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Mekanik Madde", len(items))
+    c1.metric(f"{discipline_label(discipline)} Madde", len(items))
     c2.metric("Kategori", len(grouped))
     c3.metric("Ort. Güven", f"{average_confidence(items):.2f}")
     c4.metric("Düşük Güvenli", len(low))
 
-    tab_summary, tab_cat, tab_table, tab_check, tab_json, tab_export = st.tabs(
-        ["📝 Özet", "🗂️ Kategoriler", "📊 Tablo", "✅ Checklist", "🧾 Ham JSON", "⬇️ Export"]
+    tab_summary, tab_cat, tab_table, tab_check, tab_json = st.tabs(
+        ["📝 Özet", "🗂️ Kategoriler", "📊 Tablo", "✅ Checklist", "🧾 Ham JSON"]
     )
 
     with tab_summary:
@@ -315,11 +301,11 @@ def render_results(settings: dict) -> None:
                         st.markdown(f"- **Değer/Sınır:** {it.value_or_limit}")
                     if it.related_standard:
                         st.markdown(f"- **Standart:** {it.related_standard}")
-                    st.markdown(f"- **Mekanik önem:** {it.mechanical_relevance}")
+                    st.markdown(f"- **Önem:** {it.relevance}")
                     if it.page_or_section:
                         st.markdown(f"- **Sayfa/Bölüm:** {it.page_or_section}")
                     if it.source_quote:
-                        st.caption(f"“{truncate(it.source_quote, 240)}”")
+                        st.caption(f"“{truncate(it.source_quote, 240)}” (orijinal dil)")
                     st.divider()
 
     with tab_table:
@@ -339,10 +325,10 @@ def render_results(settings: dict) -> None:
             )
 
     with tab_check:
-        st.markdown("### Mekanik Checklist")
+        st.markdown("### Checklist")
         if report.checklist:
             for i, c in enumerate(report.checklist):
-                st.checkbox(c, key=f"check_{i}", value=False)
+                st.checkbox(c, key=f"check_{discipline}_{i}", value=False)
         else:
             st.caption("Checklist boş.")
 
@@ -354,70 +340,60 @@ def render_results(settings: dict) -> None:
             }
         )
 
-    with tab_export:
-        render_export_buttons(report, items, settings)
 
+def render_export_buttons(bundle: dict) -> None:
+    """Her iki disiplini içeren dosyalar için indirme butonları üretir."""
+    title = ""
+    for report, _items in bundle.values():
+        if report.document_title:
+            title = report.document_title
+            break
+    base = safe_filename(title, "sartname_rapor")
 
-def render_export_buttons(
-    report: FinalMechanicalReport, items: list[MechanicalItem], settings: dict
-) -> None:
-    """Seçili export formatları için indirme butonları üretir."""
-    exports = settings["exports"]
-    base = safe_filename(report.document_title, "mekanik_rapor")
-
-    st.markdown("### İndirilebilir Çıktılar")
+    st.markdown("### İndirilebilir Çıktılar (Mekanik + Elektrik birlikte)")
     cols = st.columns(4)
 
-    if exports.get("json"):
-        with cols[0]:
+    with cols[0]:
+        st.download_button(
+            "⬇️ JSON",
+            data=export_json(bundle),
+            file_name=f"{base}.json",
+            mime="application/json",
+            use_container_width=True,
+        )
+
+    with cols[1]:
+        try:
             st.download_button(
-                "⬇️ JSON",
-                data=export_json(report, items),
-                file_name=f"{base}.json",
-                mime="application/json",
+                "⬇️ Excel",
+                data=export_excel(bundle),
+                file_name=f"{base}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 use_container_width=True,
             )
+        except Exception as exc:  # noqa: BLE001
+            st.error(f"Excel oluşturulamadı: {exc}")
 
-    if exports.get("excel"):
-        with cols[1]:
-            try:
-                excel_bytes = export_excel(items, report)
-                st.download_button(
-                    "⬇️ Excel",
-                    data=excel_bytes,
-                    file_name=f"{base}.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    use_container_width=True,
-                )
-            except Exception as exc:  # noqa: BLE001
-                st.error(f"Excel oluşturulamadı: {exc}")
+    with cols[2]:
+        st.download_button(
+            "⬇️ Markdown",
+            data=export_markdown(bundle).encode("utf-8"),
+            file_name=f"{base}.md",
+            mime="text/markdown",
+            use_container_width=True,
+        )
 
-    if exports.get("markdown"):
-        with cols[2]:
+    with cols[3]:
+        try:
             st.download_button(
-                "⬇️ Markdown",
-                data=export_markdown(report, items).encode("utf-8"),
-                file_name=f"{base}.md",
-                mime="text/markdown",
+                "⬇️ PDF",
+                data=export_pdf(bundle),
+                file_name=f"{base}.pdf",
+                mime="application/pdf",
                 use_container_width=True,
             )
-
-    if exports.get("pdf"):
-        with cols[3]:
-            try:
-                pdf_bytes = export_pdf(report, items)
-                st.download_button(
-                    "⬇️ PDF",
-                    data=pdf_bytes,
-                    file_name=f"{base}.pdf",
-                    mime="application/pdf",
-                    use_container_width=True,
-                )
-            except Exception as exc:  # noqa: BLE001
-                st.warning(f"PDF oluşturulamadı: {exc}")
-
-    if not any(exports.values()):
-        st.info("Sidebar'dan en az bir export formatı seçin.")
+        except Exception as exc:  # noqa: BLE001
+            st.warning(f"PDF oluşturulamadı: {exc}")
 
 
 # --------------------------------------------------------------------------- #
@@ -426,10 +402,11 @@ def render_export_buttons(
 def main() -> None:
     settings = render_sidebar()
 
-    st.title("⚙️ Mekanik Şartname Analizörü")
+    st.title("⚙️ Şartname Analizörü — Mekanik + Elektrik")
     st.markdown(
-        "Teknik şartnamelerinizi yükleyin; uygulama **mekanik mühendisliği ilgilendiren** "
-        "tüm maddeleri yapay zeka ile çıkarır, kategorilere ayırır ve indirilebilir rapor üretir."
+        "Teknik şartnamelerinizi yükleyin; uygulama **mekanik ve elektrik mühendisliğini "
+        "ilgilendiren** tüm maddeleri yapay zeka ile çıkarır, kategorilere ayırır ve "
+        "indirilebilir rapor üretir. Şartname **herhangi bir dilde** olabilir; rapor Türkçe üretilir."
     )
 
     col_file, col_url = st.columns(2)
@@ -453,7 +430,7 @@ def main() -> None:
     if analyze:
         text = read_input_document(uploaded_file, url)
         if text:
-            run_analysis(text, settings)
+            run_analysis(text)
 
     if st.session_state.analysis is not None:
         render_results(settings)
