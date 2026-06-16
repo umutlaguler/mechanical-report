@@ -131,16 +131,37 @@ class AppConfig:
     api_key: str | None = field(default=None)
 
 
-def get_api_key() -> str | None:
-    """Ortamdan OpenAI API anahtarını döndürür (yoksa None).
+def _from_secrets(key: str) -> str:
+    """Streamlit Secrets'tan bir değeri güvenli şekilde okur (yoksa boş string).
 
-    Anahtar yalnızca .env / ortam değişkeninden alınır; arayüzden girilmez.
+    st.secrets, secrets.toml yoksa erişimde hata fırlatabilir; bu yüzden korumalı.
+    """
+    try:
+        import streamlit as st
+
+        value = st.secrets.get(key, "")  # type: ignore[attr-defined]
+        return str(value).strip()
+    except Exception:  # noqa: BLE001 - secrets yoksa sessizce geç
+        return ""
+
+
+def get_api_key() -> str | None:
+    """OpenAI API anahtarını döndürür (yoksa None).
+
+    Sırayla denenir: ortam değişkeni / .env  →  Streamlit Secrets (st.secrets).
+    Hiçbir durumda arayüzden son kullanıcıya açılmaz.
+    - Yerelde: proje kökündeki `.env` dosyasına `OPENAI_API_KEY=...`.
+    - Streamlit Cloud: Settings → Secrets → `OPENAI_API_KEY="sk-..."`.
     """
     key = os.getenv("OPENAI_API_KEY", "").strip()
+    if not key:
+        key = _from_secrets("OPENAI_API_KEY")
     return key or None
 
 
 def get_default_model() -> str:
-    """Ortamdan varsayılan modeli döndürür."""
+    """Varsayılan modeli döndürür (.env veya Streamlit Secrets'tan)."""
     model = os.getenv("OPENAI_MODEL", "").strip()
+    if not model:
+        model = _from_secrets("OPENAI_MODEL")
     return model if model in AVAILABLE_MODELS else "gpt-4.1-mini"
